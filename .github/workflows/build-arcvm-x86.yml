@@ -1,13 +1,13 @@
-name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 终极可用版)
-# 支持手动触发编译，无需推送代码
+name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 AOSP官方源版)
+
 on:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # 锁定Ubuntu 22.04容器，彻底规避工具链自动升级兼容性问题
-    container: ubuntu:22.04
+    container:
+      image: ubuntu:22.04
     steps:
       - name: 安装编译依赖（无sudo适配版）
         run: |
@@ -16,49 +16,42 @@ jobs:
             wget rsync python3 python-is-python3 device-tree-compiler \
             clang lld curl ca-certificates gnupg2 patch cpio unzip
 
-      - name: 拉取ARCVM专属内核源码（LineageOS维护版·5.10基线）
+      - name: 拉取ARCVM专属内核源码（切回AOSP官方源）
         run: |
           cd ~
-          # 【核心修复】配置SSH免密拉取，彻底解决HTTPS鉴权失败问题
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-          
-          # 拉取LineageOS维护的ARCVM 5.10内核（永久保留android12-5.10分支）
-          git clone --depth=1 -b android12-5.10 git@github.com:LineageOS/android_kernel_google_arcvm.git arcvm-kernel
+          # 【核心修改】切回谷歌官方AOSP仓库，使用HTTPS匿名克隆（无需SSH密钥）
+          # 使用 --depth=1 加快速度，直接克隆 android12-5.10 分支
+          git clone --depth=1 --branch android12-5.10 https://android.googlesource.com/kernel/common.git arcvm-kernel
           cd arcvm-kernel
-          # 二次确认分支正确性
-          git checkout android12-5.10
           echo "源码拉取完成，当前分支：$(git branch --show-current)"
 
       - name: 打入KernelSU补丁（锁定v3.2.5版本·全量兼容性修复）
         run: |
           cd ~/arcvm-kernel
           
-          # 1. 下载KernelSU v3.2.5源码包（比git clone更快更稳定，完美匹配Manager v3.2.5）
+          # 1. 下载KernelSU v3.2.5源码包
           curl -LO https://github.com/tiann/KernelSU/archive/refs/tags/v3.2.5.zip
           unzip v3.2.5.zip
           rm -f v3.2.5.zip
           
-          # 2. 移动KSU源码到内核驱动目录（适配LineageOS内核结构）
+          # 2. 移动KSU源码到内核驱动目录
           mkdir -p drivers/kernelsu
           cp -r KernelSU-3.2.5/kernel/* drivers/kernelsu/
           
           # 3. 修改内核Makefile，添加KSU编译入口
           sed -i '/obj-y += char\//a obj-y += kernelsu/' drivers/Makefile
           
-          # 4. 【修复1】补全5.10内核缺失的安全特性宏（全局兜底）
+          # 4. 【修复1】补全5.10内核缺失的安全特性宏
           mkdir -p arch/x86/include/asm/
           echo -e "\n/* KernelSU Fix for Linux 5.10 */\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)" >> arch/x86/include/asm/cpu_device_id.h
           
-          # 5. 【修复2】硬编码init.c宏定义（无视LTO优化，解决宏未识别问题）
+          # 5. 【修复2】硬编码init.c宏定义
           sed -i '1i#define X86_FEATURE_INDIRECT_SAFE (1*32+21)' drivers/kernelsu/core/init.c
           
-          # 6. 【修复3】声明缺失的系统调用常量（解决__NR_syscalls未声明报错）
+          # 6. 【修复3】声明缺失的系统调用常量
           sed -i '1i\nextern const int __NR_syscalls;\n' drivers/kernelsu/hook/x86_64/syscall_hook.c
           
-          # 7. 【修复4】解决READ_ONCE宏导致的void类型语法错误（适配5.10内核宏逻辑）
+          # 7. 【修复4】解决READ_ONCE宏导致的void类型语法错误
           sed -i 's|ksu_syscall_hook_fn = READ_ONCE(syscall_hooks[orig_nr]);|void *hook_ptr = (void *)syscall_hooks[orig_nr]; ksu_syscall_hook_fn = (long (*)(int, const struct pt_regs *))hook_ptr;|' drivers/kernelsu/hook/x86_64/syscall_hook.c
           sed -i 's|return READ_ONCE(syscall_hooks[nr]) != NULL;|void *hook_ptr = (void *)syscall_hooks[nr]; return (hook_ptr != NULL);|' drivers/kernelsu/hook/x86_64/syscall_hook.c
 
@@ -66,11 +59,11 @@ jobs:
         run: |
           cd ~/arcvm-kernel
           
-          # 1. 自动匹配可用的defconfig文件
-          if [ -f "arch/x86/configs/x86_64_arcvm_defconfig" ]; then
-            export DEFCONFIG=x86_64_arcvm_defconfig
-          elif [ -f "arch/x86/configs/gki_defconfig" ]; then
+          # 1. 查找可用的defconfig文件（AOSP GKI内核通常使用 gki_defconfig）
+          if [ -f "arch/x86/configs/gki_defconfig" ]; then
             export DEFCONFIG=gki_defconfig
+          elif [ -f "arch/x86/configs/x86_64_arcvm_defconfig" ]; then
+            export DEFCONFIG=x86_64_arcvm_defconfig
           else
             echo "错误：未找到任何可用的defconfig文件"
             exit 1
@@ -80,7 +73,7 @@ jobs:
           # 2. 生成内核配置文件
           make ARCH=x86_64 $DEFCONFIG
           
-          # 3. 强制开启KernelSU支持（确保编译出KSU功能）
+          # 3. 强制开启KernelSU支持
           ./scripts/config --file .config --enable CONFIG_KSU
           
           # 4. 验证KSU配置是否生效
@@ -104,7 +97,7 @@ jobs:
           free -h
           echo "-------------------------"
 
-          # 启动编译（使用Clang适配ARCVM内核要求，LTO=thin降低内存占用）
+          # 启动编译（AOSP GKI内核推荐使用Clang）
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 \
             CFLAGS='-Wno-error -Wno-unused-function' \
             CXXFLAGS='-Wno-error -Wno-unused-function' \
@@ -117,4 +110,4 @@ jobs:
         with:
           name: arcvm-x86_64-bzImage-v3.2.5
           path: ~/arcvm-kernel/arch/x86/boot/bzImage
-          retention-days: 90  # 产物保留90天，足够下载使用
+          retention-days: 90

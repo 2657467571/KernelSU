@@ -1,5 +1,5 @@
-name: Build ARCVM x86_64 Kernel with KSU
-# 允许手动触发编译，也可推送代码时自动触发
+name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 配套最终版)
+# 支持手动触发编译，推送代码到main分支时自动触发
 on:
   workflow_dispatch:
   push:
@@ -7,9 +7,9 @@ on:
 
 jobs:
   build:
-    # 使用GitHub官方最新Runner，避免旧版本被弃用的问题
+    # 使用GitHub官方最新Runner，避免旧版本被弃用问题
     runs-on: ubuntu-latest
-    # 关键修复：指定纯净的Ubuntu 22.04容器，规避新版Runner工具链兼容性问题
+    # 锁定Ubuntu 22.04容器，彻底规避新版Runner工具链兼容性问题
     container: ubuntu:22.04
     steps:
       - name: 安装编译依赖工具
@@ -18,7 +18,7 @@ jobs:
             bc bison build-essential flex git libssl-dev libelf-dev \
             wget rsync python3 device-tree-compiler repo clang lld curl \
             ca-certificates
-          # 容器内默认无ca证书会导致repo sync报错，手动安装兜底
+          # 容器内默认无CA证书会导致repo sync报错，手动安装兜底
 
       - name: 拉取ARCVM专属内核源码（安卓12/5.10/x86_64 GKI基线）
         run: |
@@ -28,10 +28,16 @@ jobs:
           # 降低并发数避免网络波动断连，断连后可重新运行自动续传
           repo sync -j4
 
-      - name: 打入KernelSU补丁（默认最新稳定版，完美兼容5.10 GKI内核）
+      - name: 打入KernelSU补丁（锁main分支，配套Manager v3.2.5）
         run: |
           cd ~/arcvm-kernel
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          # 拉取最新main分支代码，和v3.2.5 Manager完全配套
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+          
+          # 【关键修复】补5.10内核缺失的X86_FEATURE_INDIRECT_SAFE宏，解决编译报错
+          # 5.10内核基线未定义该安全特性宏，手动添加到头文件和实现文件中
+          sed -i 's/extern const struct cpu_dev \*const __cpu_dev_array\[NR_CPUS\];/extern const struct cpu_dev \*const __cpu_dev_array\[NR_CPUS\];\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)/' arch/x86/include/asm/cpu_device_id.h
+          sed -i 's/extern const struct cpu_dev \*const __cpu_dev_array\[NR_CPUS\];/extern const struct cpu_dev \*const __cpu_dev_array\[NR_CPUS\];\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)/' arch/x86/kernel/cpu/common.c
 
       - name: 修正ARCVM专属编译配置（必做，否则VM内virtio/驱动缺失）
         run: |

@@ -1,12 +1,12 @@
-name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 AOSP官方源修正版)
-# 支持手动触发编译，无需推送代码
+name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 无Swap适配版)
+# 支持手动触发编译，无需推送代码/配置密钥
 on:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # 锁定Ubuntu 22.04容器，彻底规避工具链兼容性问题
+    # 锁定Ubuntu 22.04容器，规避工具链兼容性问题
     container: ubuntu:22.04
     steps:
       - name: 安装编译依赖（无sudo适配版）
@@ -16,28 +16,28 @@ jobs:
             wget rsync python3 python-is-python3 device-tree-compiler \
             clang lld curl ca-certificates gnupg2 patch cpio unzip
 
-      - name: 拉取ARCVM专属内核源码（切回AOSP官方源·无需鉴权）
+      - name: 拉取AOSP官方5.10内核源码（无需鉴权）
         run: |
           cd ~
-          # 【核心】使用AOSP官方通用内核仓库，HTTPS匿名克隆，无需SSH密钥
+          # 使用AOSP官方通用内核仓库，HTTPS匿名克隆，无权限问题
           # 直接拉取android12-5.10分支，深度克隆减少下载量
           git clone --depth=1 --branch android12-5.10 https://android.googlesource.com/kernel/common.git arcvm-kernel
           cd arcvm-kernel
           echo "源码拉取完成，当前分支：$(git branch --show-current)"
           echo "内核源码路径：$(pwd)"
 
-      - name: 打入KernelSU补丁（锁定v3.2.5·全量兼容性修复）
+      - name: 打入KernelSU v3.2.5补丁（5.10内核专用）
         run: |
           cd ~/arcvm-kernel
           
-          # 1. 下载KernelSU v3.2.5源码包（完美匹配Manager v3.2.5）
-          curl -LO https://github.com/tiann/KernelSU/archive/refs/tags/v3.2.5.zip
-          unzip v3.2.5.zip
-          rm -f v3.2.5.zip
+          # 1. 下载官方5.10内核专用补丁包（完美匹配v3.2.5 Manager）
+          wget https://github.com/tiann/KernelSU/releases/download/v3.2.5/kernel-su-5.10.zip
+          unzip kernel-su-5.10.zip
+          rm -f kernel-su-5.10.zip
           
           # 2. 移动KSU源码到内核驱动目录
           mkdir -p drivers/kernelsu
-          cp -r KernelSU-3.2.5/kernel/* drivers/kernelsu/
+          cp -r drivers/kernelsu/* drivers/kernelsu/
           
           # 3. 修改内核Makefile，添加KSU编译入口
           sed -i '/obj-y += char\//a obj-y += kernelsu/' drivers/Makefile
@@ -56,55 +56,51 @@ jobs:
           sed -i 's|ksu_syscall_hook_fn = READ_ONCE(syscall_hooks[orig_nr]);|void *hook_ptr = (void *)syscall_hooks[orig_nr]; ksu_syscall_hook_fn = (long (*)(int, const struct pt_regs *))hook_ptr;|' drivers/kernelsu/hook/x86_64/syscall_hook.c
           sed -i 's|return READ_ONCE(syscall_hooks[nr]) != NULL;|void *hook_ptr = (void *)syscall_hooks[nr]; return (hook_ptr != NULL);|' drivers/kernelsu/hook/x86_64/syscall_hook.c
 
-      - name: 配置内核（开启KSU+适配AOSP GKI环境）
+      - name: 配置内核（适配GKI+关闭高内存消耗选项）
         run: |
           cd ~/arcvm-kernel
           
-          # 1. AOSP Common内核默认使用gki_defconfig，优先匹配
-          if [ -f "arch/x86/configs/gki_defconfig" ]; then
-            export DEFCONFIG=gki_defconfig
-          else
-            echo "错误：未找到gki_defconfig文件"
-            exit 1
-          fi
-          echo "使用配置文件：$DEFCONFIG"
+          # 1. AOSP Common内核默认使用gki_defconfig
+          make ARCH=x86_64 gki_defconfig
           
-          # 2. 生成内核配置文件
-          make ARCH=x86_64 $DEFCONFIG
-          
-          # 3. 强制开启KernelSU支持
+          # 2. 强制开启KernelSU支持
           ./scripts/config --file .config --enable CONFIG_KSU
           
-          # 4. 验证KSU配置生效
+          # 3. 关闭高内存消耗的调试选项（避免编译时内存溢出）
+          ./scripts/config --file .config --disable CONFIG_DEBUG_INFO
+          ./scripts/config --file .config --disable CONFIG_KASAN
+          ./scripts/config --file .config --disable CONFIG_UBSAN
+          ./scripts/config --file .config --disable CONFIG_KCSAN
+          ./scripts/config --file .config --enable CONFIG_FRAME_POINTER
+          
+          # 4. 生成最终配置
+          make ARCH=x86_64 olddefconfig
+          
+          # 验证KSU配置生效
           echo "--- 验证KSU配置 ---"
           grep CONFIG_KSU .config
           echo "--------------------"
 
-      - name: 启动内核编译（修正Swap路径+内存兜底）
+      - name: 启动内核编译（纯物理内存模式·无Swap）
         run: |
           cd ~/arcvm-kernel
           
-          # 【核心修正】在当前内核源码目录创建Swap，避免路径错误
-          echo "正在创建Swap空间..."
-          rm -f ./swapfile  # 清理残留文件，使用当前目录路径
-          dd if=/dev/zero of=./swapfile bs=1M count=4096 status=none
-          chmod 0600 ./swapfile
-          mkswap ./swapfile
-          swapon ./swapfile
-          
-          # 验证Swap生效状态
-          echo "--- 当前内存/Swap状态 ---"
+          # 打印当前内存状态（无Swap，完全使用Runner物理内存）
+          echo "--- 当前内存状态 ---"
           free -h
-          echo "-------------------------"
+          echo "--------------------"
 
-          # 启动编译（AOSP GKI推荐Clang编译，LTO=thin降低内存占用）
-          echo "开始编译内核，预计耗时20-30分钟..."
+          # 编译参数说明：
+          # 1. LLVM=1 LLVM_IAS=1：使用Clang编译，适配AOSP GKI要求
+          # 2. LTO=thin：链接时优化，大幅降低内存占用
+          # 3. -j2：限制并行任务数为2，适配Runner 7GB内存限制，避免OOM
+          # 4. 所有-Wno-error：忽略无关编译警告，避免中断
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 \
             CFLAGS='-Wno-error -Wno-unused-function -Wno-maybe-uninitialized' \
             CXXFLAGS='-Wno-error -Wno-unused-function' \
             KCFLAGS=-Wno-error \
             LTO=thin \
-            -j$(nproc)
+            -j2
 
       - name: 上传编译完成的bzImage内核文件
         uses: actions/upload-artifact@v4

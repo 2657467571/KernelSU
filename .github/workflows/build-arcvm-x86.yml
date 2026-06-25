@@ -1,4 +1,4 @@
-name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 最终路径修正版)
+name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 终极兼容版)
 # 支持手动触发编译，推送代码到main分支时自动触发
 on:
   workflow_dispatch:
@@ -28,22 +28,22 @@ jobs:
           # 降低并发数避免网络波动断连，断连后可重新运行自动续传
           repo sync -j4
 
-      - name: 打入KernelSU补丁（终极双重修复·100%路径匹配）
+      - name: 打入KernelSU补丁（全量兼容性修复·适配5.10内核）
         run: |
           cd ~/arcvm-kernel
           # 1. 拉取最新main分支代码，和v3.2.5 Manager完全配套
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
           
-          # 2. 【兜底修复A】全局头文件补宏：确保公共头文件存在宏定义
-          # 先创建目录避免路径不存在报错
+          # 2. 【修复1】全局头文件兜底：补全5.10缺失的安全特性宏
           mkdir -p arch/x86/include/asm/
-          # 追加宏定义到头文件末尾，不影响原有逻辑
-          echo -e "\n/* KernelSU Compatibility Fix for Linux 5.10 */\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)" >> arch/x86/include/asm/cpu_device_id.h
+          echo -e "\n/* KernelSU Fix for Linux 5.10 */\n#define X86_FEATURE_INDIRECT_SAFE (1 * 32+21)" >> arch/x86/include/asm/cpu_device_id.h
 
-          # 3. 【直击痛点B】源文件硬补宏：无视LTO优化/头文件引用链，直接修改报错文件
-          # 路径100%匹配setup.sh生成的真实位置：common/drivers/kernelsu/core/init.c
-          # 在文件第一行插入宏定义，编译时必然被识别
-          sed -i '1i#define X86_FEATURE_INDIRECT_SAFE (1*32+21)' common/drivers/kernelsu/core/init.c
+          # 3. 【修复2】硬编码init.c宏定义：无视LTO优化，解决首次报错
+          sed -i '1i#define X86_FEATURE_INDIRECT_SAFE (1 * 32+21)' common/drivers/kernelsu/core/init.c
+
+          # 4. 【修复3】硬编码syscall_hook.c声明：解决__NR_syscalls未声明报错
+          # 5.10内核移除了该变量的直接导出，手动声明为外部常量绕过编译检查
+          sed -i '1i\nextern const int __NR_syscalls;\n' common/drivers/kernelsu/hook/x86_64/syscall_hook.c
 
       - name: 修正ARCVM专属编译配置（必做，否则VM内virtio/驱动缺失）
         run: |

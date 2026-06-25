@@ -1,5 +1,5 @@
 name: Build ARCVM x86_64 Kernel with KSU
-# 允许你在网页上手动点按钮触发编译
+# 允许手动触发编译，也可推送代码时自动触发
 on:
   workflow_dispatch:
   push:
@@ -7,36 +7,40 @@ on:
 
 jobs:
   build:
-    # 关键修改：将 ubuntu-20.04 改为 ubuntu-latest
-    # GitHub 已弃用 20.04，latest 会自动使用 22.04 或 24.04，兼容性最好
+    # 使用GitHub官方最新Runner，避免旧版本被弃用的问题
     runs-on: ubuntu-latest
+    # 关键修复：指定纯净的Ubuntu 22.04容器，规避新版Runner工具链兼容性问题
+    container: ubuntu:22.04
     steps:
-      - name: 安装编译需要的工具
+      - name: 安装编译依赖工具
         run: |
-          sudo apt update
-          sudo apt install -y bc bison build-essential flex git libssl-dev libelf-dev \
-            wget rsync python3 device-tree-compiler repo clang lld curl
+          apt update && apt install -y --no-install-recommends \
+            bc bison build-essential flex git libssl-dev libelf-dev \
+            wget rsync python3 device-tree-compiler repo clang lld curl \
+            ca-certificates
+          # 容器内默认无ca证书会导致repo sync报错，手动安装兜底
 
-      - name: 拉取ARCVM专属内核源码（安卓12/5.10/x86_64）
+      - name: 拉取ARCVM专属内核源码（安卓12/5.10/x86_64 GKI基线）
         run: |
           mkdir -p ~/arcvm-kernel && cd ~/arcvm-kernel
           repo init -u https://android.googlesource.com/kernel/manifest \
             -b common-android12-5.10-arcvm-gki-base --depth=1
-          repo sync -j8
+          # 降低并发数避免网络波动断连，断连后可重新运行自动续传
+          repo sync -j4
 
-      - name: 打入KernelSU补丁（默认最新稳定版，兼容你的5.10内核）
+      - name: 打入KernelSU补丁（默认最新稳定版，完美兼容5.10 GKI内核）
         run: |
           cd ~/arcvm-kernel
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
 
-      - name: 修正ARCVM配置（避免virtio/驱动报错，必做）
+      - name: 修正ARCVM专属编译配置（必做，否则VM内virtio/驱动缺失）
         run: |
           cd ~/arcvm-kernel
           sed -i "s/check_defconfig//" common/build.config.gki
           sed -i "s/DEFCONFIG=gki_defconfig/DEFCONFIG=x86_64_arcvm_defconfig/" common/build.config.gki
           cp common/arch/x86/configs/x86_64_arcvm_defconfig common/arch/x86/configs/x86_64_defconfig
 
-      - name: 开始编译（LTO=thin降低内存占用，自动忽略无用函数报错）
+      - name: 启动内核编译（LTO=thin降低内存占用，规避无用函数报错）
         run: |
           cd ~/arcvm-kernel
           LTO=thin \
@@ -45,8 +49,9 @@ jobs:
           BUILD_CONFIG=common/build.config.gki.x86_64 \
           build/build.sh
 
-      - name: 上传编译好的内核文件
-        uses: actions/upload-artifact@v4 # 已确认使用最新的 v4 版本
+      - name: 上传编译完成的bzImage内核文件
+        uses: actions/upload-artifact@v4
         with:
           name: arcvm-x86_64-bzImage
           path: ~/arcvm-kernel/out/android12-5.10/dist/bzImage
+          retention-days: 90  # 产物保留90天，足够下载使用

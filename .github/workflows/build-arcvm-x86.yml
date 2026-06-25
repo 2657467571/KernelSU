@@ -1,4 +1,4 @@
-name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 最终稳定版)
+name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 终极稳定版)
 # 支持手动触发编译，推送代码到main分支时自动触发
 on:
   workflow_dispatch:
@@ -12,13 +12,13 @@ jobs:
     # 锁定Ubuntu 22.04容器，彻底规避新版Runner工具链兼容性问题
     container: ubuntu:22.04
     steps:
-      - name: 安装编译依赖工具（无sudo版）
+      - name: 安装编译依赖工具（无sudo适配版）
         run: |
           apt-get update && apt-get install -y --no-install-recommends \
             bc bison build-essential flex git libssl-dev libelf-dev \
             wget rsync python3 device-tree-compiler clang lld curl \
             ca-certificates gnupg2
-          # 手动安装repo工具（适配容器环境）
+          # 手动安装repo工具（适配容器root环境）
           curl -LSs https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
           chmod +x /usr/local/bin/repo
 
@@ -31,7 +31,7 @@ jobs:
           # 4线程同步源码，平衡速度与稳定性
           repo sync -j4
 
-      - name: 打入KernelSU补丁（锁定v3.2.5版本+全量兼容性修复）
+      - name: 打入KernelSU补丁（锁定v3.2.5+全量兼容性修复）
         run: |
           cd ~/arcvm-kernel
           # 1. 拉取KernelSU源码并锁定v3.2.5 tag（完美匹配Manager v3.2.5）
@@ -55,9 +55,9 @@ jobs:
           # 6. 【修复3】声明缺失的系统调用常量（解决__NR_syscalls报错）
           sed -i '1i\nextern const int __NR_syscalls;\n' common/drivers/kernelsu/hook/x86_64/syscall_hook.c
           
-          # 7. 【修复4】解决READ_ONCE宏导致的void类型语法错误（精准匹配v3.2.5代码行号）
-          sed -i '163s|ksu_syscall_hook_fn = READ_ONCE(syscall_hooks[orig_nr]);|void *hook_ptr = (void *)syscall_hooks[orig_nr]; ksu_syscall_hook_fn = (long (*)(int, const struct pt_regs *))hook_ptr;|' common/drivers/kernelsu/hook/x86_64/syscall_hook.c
-          sed -i '200s|return READ_ONCE(syscall_hooks[nr]) != NULL;|void *hook_ptr = (void *)syscall_hooks[nr]; return (hook_ptr != NULL);|' common/drivers/kernelsu/hook/x86_64/syscall_hook.c
+          # 7. 【修复4】解决READ_ONCE宏导致的void类型语法错误（精准匹配v3.2.5代码逻辑）
+          sed -i 's|ksu_syscall_hook_fn = READ_ONCE(syscall_hooks[orig_nr]);|void *hook_ptr = (void *)syscall_hooks[orig_nr]; ksu_syscall_hook_fn = (long (*)(int, const struct pt_regs *))hook_ptr;|' common/drivers/kernelsu/hook/x86_64/syscall_hook.c
+          sed -i 's|return READ_ONCE(syscall_hooks[nr]) != NULL;|void *hook_ptr = (void *)syscall_hooks[nr]; return (hook_ptr != NULL);|' common/drivers/kernelsu/hook/x86_64/syscall_hook.c
 
       - name: 修正ARCVM编译配置（开启KSU+适配VM环境）
         run: |
@@ -79,29 +79,34 @@ jobs:
           # 验证KSU配置是否生效
           grep CONFIG_KSU common/arch/x86/configs/x86_64_defconfig
 
-      - name: 启动内核编译（无sudo Swap配置+内存兜底）
+      - name: 启动内核编译（强制清理Swap+无sudo适配）
         run: |
           cd ~/arcvm-kernel
           
-          # 【关键修复】完全无sudo创建4G Swap空间（适配容器root环境）
-          swapoff -a || true  # 关闭旧Swap避免冲突
-          rm -f /swapfile     # 清理残留文件
-          dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none  # 创建4G Swap
+          # 【核心修复】彻底清理旧Swap文件（解决挂载冲突问题）
+          # 忽略swapoff的正常报错（无活动swap时会提示，不影响后续操作）
+          swapoff -a || true
+          # 强制删除旧的swap文件，避免mkswap报"is mounted"错误
+          rm -f /swapfile
+          
+          # 创建并启用4G Swap空间（降低LTO编译内存压力）
+          dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
           chmod 0600 /swapfile
           mkswap /swapfile
           swapon /swapfile
-          # 验证Swap生效
-          echo "--- 内存/Swap状态验证 ---"
+          
+          # 验证Swap生效状态
+          echo "--- 当前内存/Swap状态 ---"
           free -h
           echo "-------------------------"
-          
+
           # 启动编译（LTO=thin降低内存占用，忽略无关函数报错）
           LTO=thin \
           CFLAGS='-Wno-error -Wno-unused-function' \
           CXXFLAGS='-Wno-error -Wno-unused-function' \
+          KCFLAGS=-Wno-error \
           BUILD_CONFIG=common/build.config.gki.x86_64 \
           TARGET_ARCH=x86_64 \
-          KCFLAGS=-Wno-error \
           build/build.sh
 
       - name: 上传编译完成的bzImage内核文件

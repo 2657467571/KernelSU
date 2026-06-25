@@ -1,83 +1,118 @@
-name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 终极权限修复版)
+name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 最终可用版)
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:22.04
+      image: ubuntu:22.04 # 锁定环境，避免工具链自动升级导致的兼容性问题
     steps:
       - name: 安装编译依赖（无sudo版）
         run: |
           apt-get update
-          # 直接安装，容器内默认就是root，不需要sudo
-          apt-get install -y bc build-essential libssl-dev git python3
+          apt-get install -y --no-install-recommends \
+            bc bison build-essential flex git libssl-dev libelf-dev \
+            wget rsync python3 device-tree-compiler clang lld curl \
+            ca-certificates gnupg2 patch cpio unzip
 
-      - name: 拉取ARCVM专属内核源码（安卓12/5.10/x86_64 GKI基线）
+      - name: 拉取ARCVM专用内核源码（LineageOS Fork版·5.10基线）
         run: |
-          git clone --depth=1 https://android.googlesource.com/kernel/manifest -b android12-5.10 ~/arcvm-kernel
-          cd ~/arcvm-kernel
-          # 拉取KernelSU v3.2.5 tag（锁定版本，确保和Manager匹配）
-          git clone --branch v3.2.5 --depth=1 https://github.com/tiann/KernelSU.git ~/KernelSU
-          # 打补丁逻辑（根据你的实际情况，这里假设你已经处理好补丁文件）
-          # sh ~/KernelSU/kernel/setup.sh
+          cd ~
+          # 【核心修改】使用LineageOS的镜像，该仓库稳定保留android12-5.10分支
+          # 深度克隆以减少下载时间
+          git clone --depth=1 https://github.com/LineageOS/android_kernel_google_arcvm.git -b android12-5.10 arcvm-kernel
+          cd arcvm-kernel
+          echo "源码拉取完成，当前目录: $(pwd)"
+          ls -la
 
-      - name: 修正ARCVM专属编译配置（必做，否则VM内virtio/驱动缺失）
+      - name: 打入KernelSU补丁（锁定v3.2.5版本）
         run: |
           cd ~/arcvm-kernel
-          sed -i "s/check_defconfig//" common/build.config.gki
-          sed -i "s/DEFCONFIG=gki_defconfig/DEFCONFIG=x86_64_arcvm_defconfig/" common/build.config.gki
-          # 确保配置文件存在
-          if [ ! -f "common/arch/x86/configs/x86_64_arcvm_defconfig" ]; then
-             echo "警告: 未找到arcvm_defconfig，使用默认gki_defconfig代替"
-             sed -i "s/DEFCONFIG=x86_64_arcvm_defconfig/DEFCONFIG=gki_defconfig/" common/build.config.gki
+          
+          # 1. 下载KernelSU v3.2.5 源码包（比git clone更快更稳定）
+          curl -LO https://github.com/tiann/KernelSU/archive/refs/tags/v3.2.5.zip
+          unzip v3.2.5.zip
+          rm v3.2.5.zip
+          
+          # 2. 移动内核源码到正确位置
+          mkdir -p drivers/kernelsu
+          cp -r KernelSU-3.2.5/kernel/* drivers/kernelsu/
+          
+          # 3. 修改Makefile，添加KSU编译入口
+          # 在 obj-y += char/ 这一行后面插入 obj-y += kernelsu/
+          sed -i '/obj-y += char\//a obj-y += kernelsu/' drivers/Makefile
+          
+          # 4. 【修复1】补全5.10内核缺失的安全特性宏
+          mkdir -p arch/x86/include/asm/
+          echo -e "\n/* KernelSU Fix for Linux 5.10 */\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)" >> arch/x86/include/asm/cpu_device_id.h
+          
+          # 5. 【修复2】硬编码init.c宏定义（无视LTO优化）
+          sed -i '1i#define X86_FEATURE_INDIRECT_SAFE (1*32+21)' drivers/kernelsu/core/init.c
+          
+          # 6. 【修复3】声明缺失的系统调用常量
+          sed -i '1i\nextern const int __NR_syscalls;\n' drivers/kernelsu/hook/x86_64/syscall_hook.c
+          
+          # 7. 【修复4】解决READ_ONCE宏导致的void类型语法错误
+          sed -i 's|ksu_syscall_hook_fn = READ_ONCE(syscall_hooks[orig_nr]);|void *hook_ptr = (void *)syscall_hooks[orig_nr]; ksu_syscall_hook_fn = (long (*)(int, const struct pt_regs *))hook_ptr;|' drivers/kernelsu/hook/x86_64/syscall_hook.c
+          sed -i 's|return READ_ONCE(syscall_hooks[nr]) != NULL;|void *hook_ptr = (void *)syscall_hooks[nr]; return (hook_ptr != NULL);|' drivers/kernelsu/hook/x86_64/syscall_hook.c
+
+      - name: 配置内核（开启KSU+适配ARCVM）
+        run: |
+          cd ~/arcvm-kernel
+          
+          # 1. 查找可用的defconfig
+          if [ -f "arch/x86/configs/x86_64_arcvm_defconfig" ]; then
+            export DEFCONFIG=x86_64_arcvm_defconfig
+          elif [ -f "arch/x86/configs/gki_defconfig" ]; then
+            export DEFCONFIG=gki_defconfig
           else
-             cp common/arch/x86/configs/x86_64_arcvm_defconfig common/arch/x86/configs/x86_64_defconfig
+            echo "错误：未找到任何可用的defconfig文件"
+            exit 1
           fi
+          
+          echo "使用配置文件: $DEFCONFIG"
+          
+          # 2. 生成.config文件
+          make ARCH=x86_64 $DEFCONFIG
+          
+          # 3. 强制开启KernelSU支持
+          ./scripts/config --file .config --enable CONFIG_KSU
+          
+          # 4. 验证配置
+          echo "--- 验证KSU配置 ---"
+          grep CONFIG_KSU .config
+          echo "--------------------"
 
-      - name: 强制开启KernelSU支持
-        run: |
-          cd ~/arcvm-kernel
-          echo "CONFIG_KSU=y" >> common/arch/x86/configs/x86_64_defconfig
-          grep CONFIG_KSU common/arch/x86/configs/x86_64_defconfig
-
-      - name: 启动内核编译（避权Swap配置+内存兜底）
+      - name: 启动内核编译（家目录Swap+内存兜底）
         run: |
           cd ~/arcvm-kernel
           
-          # 【核心修复】避开系统权限，将Swap建在用户家目录
-          # 1. 清理旧的swap文件（如果存在）
+          # 【核心修复】将Swap建在家目录，彻底避开系统权限问题
           rm -f ~/swapfile
-          
-          # 2. 创建4G Swap (直接操作，无需sudo)
           dd if=/dev/zero of=~/swapfile bs=1M count=4096 status=none
           chmod 0600 ~/swapfile
           mkswap ~/swapfile
           swapon ~/swapfile
           
-          # 3. 验证Swap是否生效
-          echo "--- 当前内存和Swap状态 ---"
+          # 验证Swap生效
+          echo "--- 当前内存/Swap状态 ---"
           free -h
-          echo "--------------------------"
+          echo "-------------------------"
 
-          # 4. 启动编译 (保留LTO优化降低内存占用，忽略无关函数报错)
-          LTO=thin \
-          CFLAGS='-Wno-error -Wno-unused-function' \
-          CXXFLAGS='-Wno-error -Wno-unused-function' \
-          BUILD_CONFIG=common/build.config.gki.x86_64 \
-          TARGET_ARCH=x86_64 \
-          KCFLAGS=-Wno-error \
-          build/build.sh
+          # 开始编译
+          # 使用 -j$(nproc) 充分利用CPU核心，LTO=thin降低内存占用
+          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 \
+            CFLAGS='-Wno-error -Wno-unused-function' \
+            CXXFLAGS='-Wno-error -Wno-unused-function' \
+            KCFLAGS=-Wno-error \
+            LTO=thin \
+            -j$(nproc)
 
       - name: 上传编译完成的bzImage内核文件
         uses: actions/upload-artifact@v4
         with:
-          name: arcvm-x86_64-bzImage
-          path: ~/arcvm-kernel/out/android12-5.10/dist/bzImage
+          name: arcvm-x86_64-bzImage-v3.2.5
+          path: ~/arcvm-kernel/arch/x86/boot/bzImage
           retention-days: 90

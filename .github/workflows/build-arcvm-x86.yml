@@ -1,5 +1,4 @@
-name: VM x86_64 Kernel with KSU (v3.2.5 配套)
-
+name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 最终稳定版)
 on:
   workflow_dispatch:
   push:
@@ -8,42 +7,44 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 锁定Ubuntu 22.04容器，彻底规避新版Runner工具链兼容性问题
     container: ubuntu:22.04
     steps:
-      - name: 安装编译依赖
+      - name: 安装编译依赖工具
         run: |
           apt update && apt install -y --no-install-recommends \
             bc bison build-essential flex git libssl-dev libelf-dev \
             wget rsync python3 device-tree-compiler repo clang lld curl \
             ca-certificates
+          # 容器内默认无CA证书会导致repo sync报错，手动安装兜底
 
-      - name: 拉取ARCVM 5.10内核源码
+      - name: 拉取ARCVM专属内核源码（安卓12/5.10/x86_64 GKI基线）
         run: |
           mkdir -p ~/arcvm-kernel && cd ~/arcvm-kernel
           repo init -u https://android.googlesource.com/kernel/manifest \
             -b common-android12-5.10-arcvm-gki-base --depth=1
+          # 降低并发数避免网络波动断连，断连后可重新运行自动续传
           repo sync -j4
 
-      - name: 打入KernelSU补丁（锁main分支 + 修复x86老内核兼容性）
+      - name: 打入KernelSU补丁（锁main分支，配套Manager v3.2.5）
         run: |
           cd ~/arcvm-kernel
-          # 1. 拉取最新main分支代码
+          # 1. 拉取最新main分支代码，和v3.2.5 Manager完全配套
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
           
-          # 2. 【双重修复】同时修补 common.c 和 hid-input.c
-          # 这两个文件都用到了老内核没有的 X86_FEATURE_INDIRECT_SAFE 宏
-          sed -i 's/extern const struct cpu_dev \*const __cpu_dev_array\[NR_CPUS\];/extern const struct cpu_dev \*const __cpu_dev_array\[NR_CPUS\];\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)/' arch/x86/include/asm/cpu_device_id.h
-          sed -i 's/extern const struct cpu_dev \*const __cpu_dev_array\[NR_CPUS\];/extern const struct cpu_dev \*const __cpu_dev_array\[NR_CPUS\];\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)/' arch/x86/kernel/cpu/common.c
-          sed -i 's/extern const struct cpu_dev \*const __cpu_dev_array\[NR_CPUS\];/extern const struct cpu_dev \*const __cpu_dev_array\[NR_CPUS\];\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)/' drivers/hid/hid-input.c
+          # 2. 【终极修复】直接追加宏定义到公共头文件末尾，无需查找特定行
+          # 5.10内核基线未定义X86_FEATURE_INDIRECT_SAFE，手动补上后所有C文件自动生效
+          # 这个宏是新内核的安全特性标识，5.10里不存在，手动定义即可兼容
+          echo -e "\n/* Manual define for KernelSU compatibility with 5.10 */\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)" >> arch/x86/include/asm/cpu_device_id.h
 
-      - name: 修正ARCVM专属编译配置
+      - name: 修正ARCVM专属编译配置（必做，否则VM内virtio/驱动缺失）
         run: |
           cd ~/arcvm-kernel
           sed -i "s/check_defconfig//" common/build.config.gki
           sed -i "s/DEFCONFIG=gki_defconfig/DEFCONFIG=x86_64_arcvm_defconfig/" common/build.config.gki
           cp common/arch/x86/configs/x86_64_arcvm_defconfig common/arch/x86/configs/x86_64_defconfig
 
-      - name: 启动内核编译
+      - name: 启动内核编译（LTO=thin降低内存占用，规避无用函数报错）
         run: |
           cd ~/arcvm-kernel
           LTO=thin \
@@ -52,9 +53,9 @@ jobs:
           BUILD_CONFIG=common/build.config.gki.x86_64 \
           build/build.sh
 
-      - name: 上传bzImage
+      - name: 上传编译完成的bzImage内核文件
         uses: actions/upload-artifact@v4
         with:
           name: arcvm-x86_64-bzImage
           path: ~/arcvm-kernel/out/android12-5.10/dist/bzImage
-          retention-days: 90
+          retention-days: 90  # 产物保留90天，足够下载使用

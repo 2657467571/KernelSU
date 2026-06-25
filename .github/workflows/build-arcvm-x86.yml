@@ -1,13 +1,13 @@
-name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 AOSP官方源版)
-
+name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 AOSP官方源修正版)
+# 支持手动触发编译，无需推送代码
 on:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: ubuntu:22.04
+    # 锁定Ubuntu 22.04容器，彻底规避工具链兼容性问题
+    container: ubuntu:22.04
     steps:
       - name: 安装编译依赖（无sudo适配版）
         run: |
@@ -16,20 +16,21 @@ jobs:
             wget rsync python3 python-is-python3 device-tree-compiler \
             clang lld curl ca-certificates gnupg2 patch cpio unzip
 
-      - name: 拉取ARCVM专属内核源码（切回AOSP官方源）
+      - name: 拉取ARCVM专属内核源码（切回AOSP官方源·无需鉴权）
         run: |
           cd ~
-          # 【核心修改】切回谷歌官方AOSP仓库，使用HTTPS匿名克隆（无需SSH密钥）
-          # 使用 --depth=1 加快速度，直接克隆 android12-5.10 分支
+          # 【核心】使用AOSP官方通用内核仓库，HTTPS匿名克隆，无需SSH密钥
+          # 直接拉取android12-5.10分支，深度克隆减少下载量
           git clone --depth=1 --branch android12-5.10 https://android.googlesource.com/kernel/common.git arcvm-kernel
           cd arcvm-kernel
           echo "源码拉取完成，当前分支：$(git branch --show-current)"
+          echo "内核源码路径：$(pwd)"
 
-      - name: 打入KernelSU补丁（锁定v3.2.5版本·全量兼容性修复）
+      - name: 打入KernelSU补丁（锁定v3.2.5·全量兼容性修复）
         run: |
           cd ~/arcvm-kernel
           
-          # 1. 下载KernelSU v3.2.5源码包
+          # 1. 下载KernelSU v3.2.5源码包（完美匹配Manager v3.2.5）
           curl -LO https://github.com/tiann/KernelSU/archive/refs/tags/v3.2.5.zip
           unzip v3.2.5.zip
           rm -f v3.2.5.zip
@@ -41,31 +42,29 @@ jobs:
           # 3. 修改内核Makefile，添加KSU编译入口
           sed -i '/obj-y += char\//a obj-y += kernelsu/' drivers/Makefile
           
-          # 4. 【修复1】补全5.10内核缺失的安全特性宏
+          # 4. 【修复1】补全5.10内核缺失的安全特性宏（全局兜底）
           mkdir -p arch/x86/include/asm/
           echo -e "\n/* KernelSU Fix for Linux 5.10 */\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)" >> arch/x86/include/asm/cpu_device_id.h
           
-          # 5. 【修复2】硬编码init.c宏定义
+          # 5. 【修复2】硬编码init.c宏定义（无视LTO优化）
           sed -i '1i#define X86_FEATURE_INDIRECT_SAFE (1*32+21)' drivers/kernelsu/core/init.c
           
-          # 6. 【修复3】声明缺失的系统调用常量
+          # 6. 【修复3】声明缺失的系统调用常量（解决__NR_syscalls未声明报错）
           sed -i '1i\nextern const int __NR_syscalls;\n' drivers/kernelsu/hook/x86_64/syscall_hook.c
           
           # 7. 【修复4】解决READ_ONCE宏导致的void类型语法错误
           sed -i 's|ksu_syscall_hook_fn = READ_ONCE(syscall_hooks[orig_nr]);|void *hook_ptr = (void *)syscall_hooks[orig_nr]; ksu_syscall_hook_fn = (long (*)(int, const struct pt_regs *))hook_ptr;|' drivers/kernelsu/hook/x86_64/syscall_hook.c
           sed -i 's|return READ_ONCE(syscall_hooks[nr]) != NULL;|void *hook_ptr = (void *)syscall_hooks[nr]; return (hook_ptr != NULL);|' drivers/kernelsu/hook/x86_64/syscall_hook.c
 
-      - name: 配置内核（开启KSU+适配ARCVM环境）
+      - name: 配置内核（开启KSU+适配AOSP GKI环境）
         run: |
           cd ~/arcvm-kernel
           
-          # 1. 查找可用的defconfig文件（AOSP GKI内核通常使用 gki_defconfig）
+          # 1. AOSP Common内核默认使用gki_defconfig，优先匹配
           if [ -f "arch/x86/configs/gki_defconfig" ]; then
             export DEFCONFIG=gki_defconfig
-          elif [ -f "arch/x86/configs/x86_64_arcvm_defconfig" ]; then
-            export DEFCONFIG=x86_64_arcvm_defconfig
           else
-            echo "错误：未找到任何可用的defconfig文件"
+            echo "错误：未找到gki_defconfig文件"
             exit 1
           fi
           echo "使用配置文件：$DEFCONFIG"
@@ -76,30 +75,32 @@ jobs:
           # 3. 强制开启KernelSU支持
           ./scripts/config --file .config --enable CONFIG_KSU
           
-          # 4. 验证KSU配置是否生效
+          # 4. 验证KSU配置生效
           echo "--- 验证KSU配置 ---"
           grep CONFIG_KSU .config
           echo "--------------------"
 
-      - name: 启动内核编译（家目录Swap+内存兜底）
+      - name: 启动内核编译（修正Swap路径+内存兜底）
         run: |
           cd ~/arcvm-kernel
           
-          # 【核心修复】将Swap建在家目录，彻底避开系统权限限制
-          rm -f ~/swapfile
-          dd if=/dev/zero of=~/swapfile bs=1M count=4096 status=none
-          chmod 0600 ~/swapfile
-          mkswap ~/swapfile
-          swapon ~/swapfile
+          # 【核心修正】在当前内核源码目录创建Swap，避免路径错误
+          echo "正在创建Swap空间..."
+          rm -f ./swapfile  # 清理残留文件，使用当前目录路径
+          dd if=/dev/zero of=./swapfile bs=1M count=4096 status=none
+          chmod 0600 ./swapfile
+          mkswap ./swapfile
+          swapon ./swapfile
           
           # 验证Swap生效状态
           echo "--- 当前内存/Swap状态 ---"
           free -h
           echo "-------------------------"
 
-          # 启动编译（AOSP GKI内核推荐使用Clang）
+          # 启动编译（AOSP GKI推荐Clang编译，LTO=thin降低内存占用）
+          echo "开始编译内核，预计耗时20-30分钟..."
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 \
-            CFLAGS='-Wno-error -Wno-unused-function' \
+            CFLAGS='-Wno-error -Wno-unused-function -Wno-maybe-uninitialized' \
             CXXFLAGS='-Wno-error -Wno-unused-function' \
             KCFLAGS=-Wno-error \
             LTO=thin \
@@ -110,4 +111,4 @@ jobs:
         with:
           name: arcvm-x86_64-bzImage-v3.2.5
           path: ~/arcvm-kernel/arch/x86/boot/bzImage
-          retention-days: 90
+          retention-days: 90  # 产物保留90天，足够下载使用

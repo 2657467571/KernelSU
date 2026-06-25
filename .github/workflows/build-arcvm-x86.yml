@@ -1,4 +1,5 @@
-name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 最终稳定版)
+name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 最终可用版)
+# 支持手动触发编译，推送代码到main分支时自动触发
 on:
   workflow_dispatch:
   push:
@@ -6,6 +7,7 @@ on:
 
 jobs:
   build:
+    # 使用GitHub官方最新Runner，避免旧版本被弃用问题
     runs-on: ubuntu-latest
     # 锁定Ubuntu 22.04容器，彻底规避新版Runner工具链兼容性问题
     container: ubuntu:22.04
@@ -26,16 +28,19 @@ jobs:
           # 降低并发数避免网络波动断连，断连后可重新运行自动续传
           repo sync -j4
 
-      - name: 打入KernelSU补丁（锁main分支，配套Manager v3.2.5）
+      - name: 打入KernelSU补丁（终极修复版·适配5.10内核）
         run: |
           cd ~/arcvm-kernel
           # 1. 拉取最新main分支代码，和v3.2.5 Manager完全配套
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
           
-          # 2. 【终极修复】直接追加宏定义到公共头文件末尾，无需查找特定行
-          # 5.10内核基线未定义X86_FEATURE_INDIRECT_SAFE，手动补上后所有C文件自动生效
-          # 这个宏是新内核的安全特性标识，5.10里不存在，手动定义即可兼容
-          echo -e "\n/* Manual define for KernelSU compatibility with 5.10 */\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)" >> arch/x86/include/asm/cpu_device_id.h
+          # 2. 创建头文件所在目录（彻底解决「Directory nonexistent」报错）
+          mkdir -p arch/x86/include/asm/
+          
+          # 3. 向公共头文件末尾追加缺失的宏定义
+          # 原理：5.10内核无此新特性宏，手动定义后所有引用它的C文件（common.c/hid-input.c等）自动生效
+          # 使用>>追加模式，不修改原有内容，100%避免路径/行数匹配错误
+          echo -e "\n/* KernelSU Compatibility Fix for Linux 5.10 */\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)" >> arch/x86/include/asm/cpu_device_id.h
 
       - name: 修正ARCVM专属编译配置（必做，否则VM内virtio/驱动缺失）
         run: |

@@ -1,4 +1,4 @@
-name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 终极源码修复版)
+name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 全坑修复最终版)
 # 支持手动触发编译，推送代码到main分支时自动触发
 on:
   workflow_dispatch:
@@ -28,7 +28,7 @@ jobs:
           # 降低并发数避免网络波动断连，断连后可重新运行自动续传
           repo sync -j4
 
-      - name: 打入KernelSU补丁（全量源码修复·适配5.10内核）
+      - name: 打入KernelSU补丁（全量兼容性修复·适配5.10内核）
         run: |
           cd ~/arcvm-kernel
           # 1. 拉取最新main分支代码，和v3.2.5 Manager完全配套
@@ -45,11 +45,11 @@ jobs:
           # 5.10内核移除了该变量的直接导出，手动声明为外部常量绕过编译检查
           sed -i '1i\nextern const int __NR_syscalls;\n' common/drivers/kernelsu/hook/x86_64/syscall_hook.c
 
-          # 5. 【🔥核心修复】解决READ_ONCE宏展开导致的void类型报错
+          # 5. 【核心修复】解决READ_ONCE宏展开导致的void类型报错
           # 原理：绕过内核宏的语法冲突，用临时变量中转指针值，避免直接操作void类型
-          # 修复第163行附近的赋值错误（对应你日志里的报错位置）
+          # 修复第163行附近的赋值错误
           sed -i '163s|ksu_syscall_hook_fn = READ_ONCE(syscall_hooks[orig_nr]);|void *hook_ptr = (void *)syscall_hooks[orig_nr]; ksu_syscall_hook_fn = (long (*)(int, const struct pt_regs *))hook_ptr;|' common/drivers/kernelsu/hook/x86_64/syscall_hook.c
-          # 修复第200行附近的判空错误（对应你日志里的报错位置）
+          # 修复第200行附近的判空错误
           sed -i '200s|return READ_ONCE(syscall_hooks[nr]) != NULL;|void *hook_ptr = (void *)syscall_hooks[nr]; return (hook_ptr != NULL);|' common/drivers/kernelsu/hook/x86_64/syscall_hook.c
 
       - name: 修正ARCVM专属编译配置（必做，否则VM内virtio/驱动缺失）
@@ -59,15 +59,22 @@ jobs:
           sed -i "s/DEFCONFIG=gki_defconfig/DEFCONFIG=x86_64_arcvm_defconfig/" common/build.config.gki
           cp common/arch/x86/configs/x86_64_arcvm_defconfig common/arch/x86/configs/x86_64_defconfig
 
-      - name: 启动内核编译（增加Swap防内存溢出）
+      - name: 启动内核编译（修复Swap权限+内存兜底）
         run: |
           cd ~/arcvm-kernel
-          # 增加4G虚拟内存，避免LTO编译时内存不足导致崩溃
-          fallocate -l 4G /swapfile
-          chmod 600 /swapfile
-          mkswap /swapfile
-          swapon /swapfile
+          
+          # 【关键修复】用dd替代fallocate创建Swap，彻底解决Permission denied问题
+          # 先关闭可能存在的旧Swap，避免冲突
+          sudo swapoff -a || true
+          # 创建4G Swap文件（dd兼容性远好于fallocate，适配所有受限容器环境）
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
+          sudo chmod 0600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          # 验证Swap生效
+          free -h
 
+          # 启动编译（保留LTO优化降低内存占用，忽略无关函数报错）
           LTO=thin \
           CFLAGS='-Wno-error -Wno-unused-function' \
           CXXFLAGS='-Wno-error -Wno-unused-function' \

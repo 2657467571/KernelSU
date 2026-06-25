@@ -1,0 +1,49 @@
+name: Build ARCVM x86_64 Kernel with KSU
+on:
+  workflow_dispatch:  # 手动触发
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt update
+          sudo apt install -y bc bison build-essential flex git libssl-dev libelf-dev \
+            wget rsync python3 device-tree-compiler repo clang lld curl
+
+      - name: 拉取ARCVM 5.10内核源码
+        run: |
+          mkdir -p ~/arcvm-kernel && cd ~/arcvm-kernel
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b common-android12-5.10-arcvm-gki-base --depth=1
+          repo sync -j8
+
+      - name: 打入KernelSU补丁
+        run: |
+          cd ~/arcvm-kernel
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+
+      - name: 修正ARCVM配置
+        run: |
+          cd ~/arcvm-kernel
+          sed -i "s/check_defconfig//" common/build.config.gki
+          sed -i "s/DEFCONFIG=gki_defconfig/DEFCONFIG=x86_64_arcvm_defconfig/" common/build.config.gki
+          cp common/arch/x86/configs/x86_64_arcvm_defconfig common/arch/x86/configs/x86_64_defconfig
+
+      - name: 编译内核
+        run: |
+          cd ~/arcvm-kernel
+          LTO=thin \
+          CFLAGS='-Wno-error -Wno-unused-function' \
+          CXXFLAGS='-Wno-error -Wno-unused-function' \
+          BUILD_CONFIG=common/build.config.gki.x86_64 \
+          build/build.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: arcvm-x86_64-bzImage
+          path: ~/arcvm-kernel/out/android12-5.10/dist/bzImage

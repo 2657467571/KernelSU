@@ -1,8 +1,38 @@
-      - name: 打入 KernelSU v3.2.5（改用 git clone 避免 zip 损坏）
+name: Build ARCVM x86_64 Kernel + KSU v3.2.5
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+
+    steps:
+      - name: 安装依赖
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq \
+            bc bison build-essential flex git libssl-dev libelf-dev \
+            clang lld llvm curl wget python3 python3-pip \
+            device-tree-compiler rsync cpio unzip repo \
+            ca-certificates
+
+      - name: 拉取 ARCVM 5.10 内核源码
+        run: |
+          mkdir -p ~/arcvm-kernel && cd ~/arcvm-kernel
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b common-android12-5.10-arcvm-gki-base --depth=1
+          repo sync -c -j4 || repo sync -c -j2
+          echo "✅ 源码就绪"
+
+      - name: 打入 KernelSU v3.2.5（git clone 方式）
         run: |
           cd ~/arcvm-kernel
 
-          # 1. 克隆 KernelSU 仓库并切换到 v3.2.5 tag
+          # 1. 克隆 KernelSU 并切换到 v3.2.5
           git clone --depth=1 --branch v3.2.5 https://github.com/tiann/KernelSU.git ksu_repo
 
           # 2. 拷贝内核代码到 common/drivers/kernelsu
@@ -15,7 +45,7 @@
             sed -i '/obj-y += char\//a obj-y += kernelsu/' common/drivers/Makefile
           fi
 
-          # 4. 5.10 兼容修复（同上）
+          # 4. 5.10 兼容性修复
           mkdir -p common/arch/x86/include/asm
           if ! grep -q INDIRECT_SAFE common/arch/x86/include/asm/cpu_device_id.h; then
             echo -e "\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)" \
@@ -32,4 +62,43 @@
           sed -i 's|return READ_ONCE(syscall_hooks\[nr\]) != NULL;|void *hook_ptr = (void *)syscall_hooks[nr]; return (hook_ptr != NULL);|' \
             common/drivers/kernelsu/hook/x86_64/syscall_hook.c
 
-          echo "✅ KSU v3.2.5 打入完成（git clone 方式）"
+          echo "✅ KSU v3.2.5 打入完成"
+
+      - name: 配置内核（ARCVM + KSU）
+        run: |
+          cd ~/arcvm-kernel
+          if [ -f common/arch/x86/configs/x86_64_arcvm_defconfig ]; then
+            export DEFCONFIG=x86_64_arcvm_defconfig
+          else
+            export DEFCONFIG=gki_defconfig
+          fi
+          cd common && make ARCH=x86_64 $DEFCONFIG
+
+          ./scripts/config --file .config --enable CONFIG_KSU
+          for o in VIRTIO_BLK VIRTIO_NET VIRTIO_FS VIRTIO_CONSOLE VIRTIO_INPUT \
+                   9P_FS NET_9P NET_9P_VIRTIO; do
+            ./scripts/config --file .config --enable CONFIG_$o
+          done
+          for o in DEBUG_INFO KASAN UBSAN KCSAN DEBUG_LIST DEBUG_SPINLOCK; do
+            ./scripts/config --file .config --disable CONFIG_$o
+          done
+          make ARCH=x86_64 olddefconfig
+          grep CONFIG_KSU .config
+          echo "✅ 配置完成"
+
+      - name: 编译内核
+        run: |
+          cd ~/arcvm-kernel/common
+          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 \
+            CFLAGS='-Wno-error -Wno-unused-function -Wno-maybe-uninitialized' \
+            CXXFLAGS='-Wno-error -Wno-unused-function' \
+            KCFLAGS=-Wno-error \
+            LTO=thin \
+            -j4
+
+      - name: 上传 bzImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: arcvm-x86_64-ksu-v3.2.5
+          path: ~/arcvm-kernel/common/arch/x86/boot/bzImage
+          retention-days: 90

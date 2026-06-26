@@ -1,164 +1,113 @@
-name: Build ARCVM x86_64 Kernel with KSU (v3.2.5 本地源码集成版)
+name: Build ARCVM x86_64 Kernel + KSU v3.2.5
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: us-docker.pkg.dev/android-ci-images/images/android-ci:latest
-      options: --user root # 确保容器内有root权限执行后续操作
+    container: ubuntu:22.04
 
     steps:
-      - name: 同步 AOSP 官方 5.10 内核源码
+      - name: 安装依赖（无 sudo，容器内已是 root）
         run: |
-          mkdir -p ~/arcvm-kernel
-          cd ~/arcvm-kernel
-          
-          # 使用官方 HTTPS 源，无需任何鉴权密钥
-          git clone --depth=1 https://android.googlesource.com/kernel/common.git .
-          git checkout android12-5.10
-          echo "源码拉取完成"
+          apt-get update -qq
+          apt-get install -y -qq \
+            bc bison build-essential flex git libssl-dev libelf-dev \
+            clang lld llvm curl wget python3 python3-pip \
+            device-tree-compiler rsync cpio unzip repo \
+            ca-certificates
 
-      - name: 本地集成 KernelSU v3.2.5 源码
+      - name: 拉取 ARCVM 5.10 内核源码（AOSP common）
         run: |
-          cd ~/arcvm-kernel
-          
-          # 1. 创建 KernelSU 源码目录
-          mkdir -p drivers/kernelsu
-          
-          # 2. 直接写入核心源码文件（基于官方 v3.2.5 Release 内容硬编码）
-          # 这一步完全绕过网络下载，保证 100% 成功
-          echo "正在注入 KernelSU 核心源码..."
-          
-          # 写入 ksu.h (内核态接口)
-          cat << 'EOF' > drivers/kernelsu/ksu.h
-#ifndef _DRIVERS_KERNELSU_H
-#define _DRIVERS_KERNELSU_H
+          mkdir -p ~/arcvm-kernel && cd ~/arcvm-kernel
+          # 用 repo 拉，比纯 git clone 更容易对齐 ARCVM defconfig
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b common-android12-5.10-arcvm-gki-base --depth=1
+          repo sync -c -j4 || repo sync -c -j2
+          echo "✅ 源码就绪"
 
-#include <linux/fs.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/uaccess.h>
-#include <linux/version.h>
-
-// 接口定义
-void ksu_execve_handler(void);
-void ksu_hook_ptrace(void);
-void ksu_su_file_handler(struct inode *inode, int *allowed);
-int ksu_unlink_hook(struct inode *dir, struct dentry *dentry);
-int ksu_rename_hook(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry);
-
-// 辅助函数
-#if defined(CONFIG_ARM64)
-#define KSU_DEVICE_NAME "ksu"
-#elif defined(CONFIG_X86_64)
-#define KSU_DEVICE_NAME "ksu"
-#endif
-
-#endif // _DRIVERS_KERNELSU_H
-EOF
-
-          # 写入 ksu.c (核心逻辑)
-          cat << 'EOF' > drivers/kernelsu/ksu.c
-#include "ksu.h"
-#include <linux/security.h>
-#include <linux/binfmts.h>
-#include <linux/namei.h>
-
-static struct security_hook_list ksu_hooks[] __ro_after_init = {
-    LSM_HOOK_INIT(bprm_check_security, ksu_execve_handler),
-};
-
-void ksu_execve_handler(void)
-{
-    // 简单的 SU 检测逻辑占位
-    pr_info("KernelSU: execve hook triggered\n");
-}
-
-static int __init ksu_init(void)
-{
-    pr_info("KernelSU: Loaded (v3.2.5)\n");
-    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");
-    return 0;
-}
-
-static void __exit ksu_exit(void)
-{
-    pr_info("KernelSU: Unloaded\n");
-}
-
-module_init(ksu_init);
-module_exit(ksu_exit);
-
-MODULE_AUTHOR("KernelSU Team");
-MODULE_DESCRIPTION("KernelSU for ARCVM");
-MODULE_VERSION("3.2.5");
-MODULE_LICENSE("GPL");
-EOF
-
-          # 写入 Makefile
-          cat << 'EOF' > drivers/kernelsu/Makefile
-obj-y += ksu.o
-EOF
-
-          echo "KernelSU 源码注入完毕"
-
-      - name: 应用补丁并配置内核 (开启 KSU)
+      - name: 打入 KernelSU v3.2.5（云端版修复全量）
         run: |
           cd ~/arcvm-kernel
-          
-          # 1. 修改 Kconfig，让系统识别 KernelSU 驱动
-          echo "source \"drivers/kernelsu/Kconfig\"" >> drivers/Kconfig
-          
-          # 2. 修改 Makefile，将 ksu 编入内核
-          # 注意：这里需要简单的 sed 操作来追加
-          sed -i 's/obj-y\s*+=.*/& drivers\/kernelsu/' drivers/Makefile
-          
-          # 3. 配置内核
-          make ARCH=x86_64 gki_defconfig
-          
-          # 4. 开启 KernelSU 和必要特性
+
+          # 1. 拉 KSU v3.2.5（用 release 包最稳）
+          curl -LO https://github.com/tiann/KernelSU/releases/download/v3.2.5/kernel-su-5.10.zip
+          unzip -o kernel-su-5.10.zip
+          rm kernel-su-5.10.zip
+
+          # 2. 拷贝进内核
+          mkdir -p common/drivers/kernelsu
+          cp -r drivers/kernelsu/* common/drivers/kernelsu/
+
+          # 3. Makefile 入口
+          if ! grep -q kernelsu common/drivers/Makefile; then
+            sed -i '/obj-y += char\//a obj-y += kernelsu/' common/drivers/Makefile
+          fi
+
+          # 4. 5.10 兼容修复（云端必炸项，全部收敛）
+          mkdir -p common/arch/x86/include/asm
+          # 修复 X86_FEATURE_INDIRECT_SAFE
+          if ! grep -q INDIRECT_SAFE common/arch/x86/include/asm/cpu_device_id.h; then
+            echo -e "\n#define X86_FEATURE_INDIRECT_SAFE (1*32+21)" \
+              >> common/arch/x86/include/asm/cpu_device_id.h
+          fi
+          sed -i '1i#define X86_FEATURE_INDIRECT_SAFE (1*32+21)' \
+            common/drivers/kernelsu/core/init.c
+
+          # 修复 __NR_syscalls
+          sed -i '1i\nextern const int __NR_syscalls;\n' \
+            common/drivers/kernelsu/hook/x86_64/syscall_hook.c
+
+          # 修复 READ_ONCE → void 报错
+          sed -i 's|ksu_syscall_hook_fn = READ_ONCE(syscall_hooks\[orig_nr\]);|void *hook_ptr = (void *)syscall_hooks[orig_nr]; ksu_syscall_hook_fn = (long (*)(int, const struct pt_regs *))hook_ptr;|' \
+            common/drivers/kernelsu/hook/x86_64/syscall_hook.c
+          sed -i 's|return READ_ONCE(syscall_hooks\[nr\]) != NULL;|void *hook_ptr = (void *)syscall_hooks[nr]; return (hook_ptr != NULL);|' \
+            common/drivers/kernelsu/hook/x86_64/syscall_hook.c
+
+          echo "✅ KSU v3.2.5 打入完成"
+
+      - name: 配置内核（ARCVM + KSU）
+        run: |
+          cd ~/arcvm-kernel
+          # ARCVM 专用 defconfig，不存在就兜底 gki
+          if [ -f common/arch/x86/configs/x86_64_arcvm_defconfig ]; then
+            export DEFCONFIG=x86_64_arcvm_defconfig
+          else
+            export DEFCONFIG=gki_defconfig
+          fi
+          cd common && make ARCH=x86_64 $DEFCONFIG
+
           ./scripts/config --file .config --enable CONFIG_KSU
-          ./scripts/config --file .config --enable CONFIG_MODULES
-          ./scripts/config --file .config --enable CONFIG_KALLSYMS
-          ./scripts/config --file .config --enable CONFIG_HAVE_KPROBES
-          ./scripts/config --file .config --enable CONFIG_KPROBES
-          ./scripts/config --file .config --enable CONFIG_HAVE_FUNCTION_TRACER
-          
-          # 解决 5.10 内核编译警告转错误的问题
-          ./scripts/config --file .config --set-val CONFIG_INIT_STACK_ALL_ZERO n
-          
-          # 生成最终配置
+          # ARCVM virtio 必要驱动
+          for o in VIRTIO_BLK VIRTIO_NET VIRTIO_FS VIRTIO_CONSOLE VIRTIO_INPUT \
+                   9P_FS NET_9P NET_9P_VIRTIO; do
+            ./scripts/config --file .config --enable CONFIG_$o
+          done
+          # 关调试防 OOM
+          for o in DEBUG_INFO KASAN UBSAN KCSAN DEBUG_LIST DEBUG_SPINLOCK; do
+            ./scripts/config --file .config --disable CONFIG_$o
+          done
           make ARCH=x86_64 olddefconfig
-          
-          echo "--- 验证 KSU 配置 ---"
           grep CONFIG_KSU .config
-          echo "--------------------"
+          echo "✅ 配置完成"
 
-      - name: 启动内核编译 (纯物理内存模式)
+      - name: 编译（-j 不拉满，云端 runner 内存有限）
         run: |
-          cd ~/arcvm-kernel
-          
-          echo "--- 当前内存状态 ---"
-          free -h
-          echo "--------------------"
-
-          # 编译参数优化：
-          # -j2：限制双线程，防止 GitHub Actions 内存溢出 (OOM)
-          # LTO=thin：保持链接时优化，减少体积
+          cd ~/arcvm-kernel/common
+          # 云端 runner 一般 7GB 内存，不建 swap 也 ok，-j4 稳
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 \
             CFLAGS='-Wno-error -Wno-unused-function -Wno-maybe-uninitialized' \
             CXXFLAGS='-Wno-error -Wno-unused-function' \
             KCFLAGS=-Wno-error \
             LTO=thin \
-            -j2
+            -j4
 
-      - name: 上传编译产物
+      - name: 上传 bzImage
         uses: actions/upload-artifact@v4
         with:
-          name: arcvm-x86_64-kernel-v3.2.5
-          path: ~/arcvm-kernel/arch/x86/boot/bzImage
-          retention-days: 7
+          name: arcvm-x86_64-ksu-v3.2.5
+          path: ~/arcvm-kernel/common/arch/x86/boot/bzImage
+          retention-days: 90
